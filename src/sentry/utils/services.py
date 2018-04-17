@@ -4,7 +4,7 @@ import functools
 import inspect
 import itertools
 import logging
-import operator
+import threading
 
 from django.utils.functional import empty, LazyObject
 
@@ -177,6 +177,12 @@ class ServiceDelegator(Service):
         function.
         """
 
+    class ServiceState(threading.local):
+        def __init__(self):
+            self.backends = {}
+
+    state = ServiceState()
+
     def __init__(self, backend_base, backends, selector_func, callback_func=None):
         self.__backend_base = import_string(backend_base)
 
@@ -228,6 +234,13 @@ class ServiceDelegator(Service):
             return base_value
 
         def execute(*args, **kwargs):
+            # If we're already in a backend, execute this method synchronously
+            # without delegation.
+            if self in self.state.backends:
+                backend, depth = self.state.backends[self]
+                assert depth > 0
+                return getattr(backend, attribute_name)(*args, **kwargs)
+
             # Binding the call arguments to named arguments has two benefits:
             # 1. These values always be passed in the same form to the selector
             #    function and callback, regardless of how they were passed to
@@ -250,7 +263,30 @@ class ServiceDelegator(Service):
                     '{!r} is not a registered backend.'.format(
                         selected_backend_names[0]))
 
-            call_backend_method = operator.methodcaller(attribute_name, *args, **kwargs)
+            def call_backend_method(backend):
+                state = self.state
+
+                # Set or increment the active count for this thread.
+                if self in state.backends:
+                    active_backend, depth = state.backends[self]
+                    assert active_backend is backend
+                    assert depth > 0
+                    state.backends[self] = (backend, depth + 1)
+                else:
+                    state.backends[self] = (backend, 1)
+
+                try:
+                    return getattr(backend, attribute_name)(*args, **kwargs)
+                finally:
+                    # Decrement the active count for this thread.
+                    active_backend, depth = state.backends[self]
+                    assert active_backend is backend
+                    assert depth > 0
+                    depth = depth - 1
+                    if depth == 0:
+                        del state.backends[self]
+                    else:
+                        state.backends[self] = (backend, depth)
 
             # Enqueue all of the secondary backend requests first since these
             # are non-blocking queue insertions. (Since the primary backend
